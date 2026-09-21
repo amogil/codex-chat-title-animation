@@ -1,0 +1,1 @@
+# codex-chat-title-animation
