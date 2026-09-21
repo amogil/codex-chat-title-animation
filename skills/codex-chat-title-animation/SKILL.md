@@ -1,6 +1,6 @@
 ---
 name: codex-chat-title-animation
-description: Start or stop a non-blocking animated title in the current Codex task. Use when the user asks to animate or stop animating a task title.
+description: Start or stop an animated title in the current Codex task using a managed background terminal session. Use when the user asks to animate or stop animating a task title.
 ---
 
 # Codex chat title animation
@@ -8,7 +8,7 @@ description: Start or stop a non-blocking animated title in the current Codex ta
 Use this skill only for an explicit request to animate a Codex task title. It
 relies on internal local IPC and is experimental.
 
-The script has two actions. Both return immediately:
+The script has two actions:
 
 ```zsh
 SKILL_PATH="${CODEX_HOME:-$HOME/.codex}/skills/codex-chat-title-animation"
@@ -17,8 +17,11 @@ zsh "$SKILL_PATH/scripts/codex-title-animation.sh" start "$CODEX_THREAD_ID" "Rev
 zsh "$SKILL_PATH/scripts/codex-title-animation.sh" stop "$CODEX_THREAD_ID"
 ```
 
-- `start` creates a detached process and prints its PID. If the same task is
-  already animated, it replaces the earlier animation with a new process.
+- `start` prints its PID and intentionally remains running. Invoke it in a
+  terminal with a short initial yield. When the terminal tool returns a running
+  session, leave that session active and do not wait for completion. From the
+  user's perspective the start is non-blocking. If the same task is already
+  animated, the new terminal session signals and replaces the earlier one.
 - Different tasks may animate concurrently, but each task has exactly one
   current animation process tracked by its thread id.
 - `current-work` is an optional short description of the task or stage the
@@ -33,12 +36,13 @@ zsh "$SKILL_PATH/scripts/codex-title-animation.sh" stop "$CODEX_THREAD_ID"
   Without a filename, use the first file in alphabetical order. When the only
   optional argument ends in `.txt`, the script treats it as `animation-file`
   and leaves `current-work` empty.
-- `stop` terminates only the tracked animation for that task. It is safe when
-  no animation is running.
+- `stop` returns immediately after terminating only the tracked animation
+  session for that task. It is safe when no animation is running.
 
 Before `start`, confirm that `CODEX_THREAD_ID` is non-empty. Always generate and
 pass a current-work description from the task context. Never ask the user to
-provide it. Report that the animation continues independently after the
-command returns. To stop it, run the `stop` command above. Do not use this skill
-for persistent production automation or to change a task title without the
-user's request.
+provide it. After the terminal tool yields a running session, report that the
+animation continues in that managed session. Do not poll or wait on it. To stop
+it, run the `stop` command above; the original terminal session should then
+finish. Do not use this skill for persistent production automation or to change
+a task title without the user's request.

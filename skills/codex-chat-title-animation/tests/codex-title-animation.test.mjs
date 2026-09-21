@@ -20,30 +20,24 @@ function readAnimationState(environment, threadId) {
   return JSON.parse(readFileSync(file, "utf8"));
 }
 
-function fakeProcessManager() {
+function fakeSessionManager() {
   let nextPid = 4100;
-  const running = new Set();
-  const spawned = [];
+  const running = new Map();
   const killed = [];
   return {
     dependencies: {
-      spawn: (_command, argumentsValue, options) => {
-        const child = { pid: ++nextPid, unrefCalled: false, unref() { this.unrefCalled = true; } };
-        running.add(child.pid);
-        spawned.push({ argumentsValue, child, options });
-        return child;
-      },
+      getPid: () => ++nextPid,
+      setProcessTitle: (title, pid) => running.set(pid, title),
       isRunning: (pid) => running.has(pid),
-      processCommand: (state) => `${state.scriptPath} run ${state.threadId} ${state.animationFile} ${state.runId}`,
+      processCommand: (state) => running.get(state.pid) || "",
       resolveAnimation: (fileName) => ({ fileName: fileName || "ping-pong.txt", steps: [{ frame: "frame", delaySeconds: 1 }] }),
       kill: (pid, signal) => {
         killed.push({ pid, signal });
-        running.delete(pid);
+        if (!running.delete(pid)) throw Object.assign(new Error("already gone"), { code: "ESRCH" });
       }
     },
     killed,
-    running,
-    spawned
+    running
   };
 }
 
@@ -496,29 +490,10 @@ test("runAnimation removes state when its animation file cannot be loaded", asyn
   assert.equal(existsSync(stateFile), false);
 });
 
-test("start is non-blocking and a repeated start replaces the tracked process", (t) => {
-  const environment = temporaryEnvironment();
-  t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
-  const child = { pid: process.pid, unrefCalled: false, unref() { this.unrefCalled = true; } };
-  let terminationCount = 0;
-  const childArguments = [];
-  const dependencies = {
-    spawn: (_command, argumentsValue) => { childArguments.push(argumentsValue); return child; },
-    processCommand: (state) => `${state.scriptPath} run thread-42 ${state.runId}`,
-    resolveAnimation: (fileName) => ({ fileName: fileName || "ping-pong.txt", steps: [{ frame: "frame", delaySeconds: 1 }] }),
-    kill: () => { terminationCount += 1; }
-  };
-  assert.deepEqual(startAnimation("thread-42", environment, dependencies, "ping-pong.txt"), { started: true, pid: process.pid });
-  assert.equal(child.unrefCalled, true);
-  assert.deepEqual(startAnimation("thread-42", environment, dependencies, "next-animation.txt"), { started: true, pid: process.pid });
-  assert.equal(terminationCount, 1);
-  assert.equal(childArguments[1][3], "next-animation.txt");
-});
-
-test("start uses the first animation file by default and detaches the child", (t) => {
+test("start prepares the current process as a foreground animation session", (t) => {
   const environment = temporaryEnvironment();
   const animationDirectory = mkdtempSync(path.join(os.tmpdir(), "codex-title-animation-files-"));
-  const manager = fakeProcessManager();
+  const manager = fakeSessionManager();
   const dependencies = { ...manager.dependencies, animationDirectory };
   delete dependencies.resolveAnimation;
   t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
@@ -527,14 +502,13 @@ test("start uses the first animation file by default and detaches the child", (t
   writeFileSync(path.join(animationDirectory, "a.txt"), "a 1\n");
 
   const result = startAnimation("thread-a", environment, dependencies);
-  const spawnCall = manager.spawned[0];
-  assert.equal(readAnimationState(environment, "thread-a").animationFile, "a.txt");
-  assert.equal(spawnCall.argumentsValue[3], "a.txt");
-  assert.equal(spawnCall.options.detached, true);
-  assert.equal(spawnCall.options.stdio, "ignore");
-  assert.equal(spawnCall.options.env, environment);
-  assert.equal(spawnCall.child.unrefCalled, true);
-  assert.equal(result.pid, spawnCall.child.pid);
+  const state = readAnimationState(environment, "thread-a");
+  assert.equal(result.pid, state.pid);
+  assert.equal(result.runId, state.runId);
+  assert.equal(result.animationFile, "a.txt");
+  assert.equal(state.animationFile, "a.txt");
+  assert.equal(state.processTitle, `codex-title-animation:thread-a:${state.runId}`);
+  assert.equal(manager.running.get(state.pid), state.processTitle);
 });
 
 test("start and stop reject an empty thread id", () => {
@@ -544,7 +518,7 @@ test("start and stop reject an empty thread id", () => {
 
 test("different threads run independently at the same time", (t) => {
   const environment = temporaryEnvironment();
-  const manager = fakeProcessManager();
+  const manager = fakeSessionManager();
   t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
 
   const first = startAnimation("thread-a", environment, manager.dependencies, "ping-pong.txt");
@@ -561,7 +535,7 @@ test("different threads run independently at the same time", (t) => {
 
 test("restarting one thread replaces only that thread animation", (t) => {
   const environment = temporaryEnvironment();
-  const manager = fakeProcessManager();
+  const manager = fakeSessionManager();
   t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
 
   const firstA = startAnimation("thread-a", environment, manager.dependencies, "ping-pong.txt");
@@ -579,7 +553,7 @@ test("restarting one thread replaces only that thread animation", (t) => {
 
 test("stopping one thread does not stop another thread animation", (t) => {
   const environment = temporaryEnvironment();
-  const manager = fakeProcessManager();
+  const manager = fakeSessionManager();
   t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
 
   const firstA = startAnimation("thread-a", environment, manager.dependencies);
@@ -595,7 +569,7 @@ test("stopping one thread does not stop another thread animation", (t) => {
 
 test("a stale state starts a replacement without signaling an unrelated PID", (t) => {
   const environment = temporaryEnvironment();
-  const manager = fakeProcessManager();
+  const manager = fakeSessionManager();
   const stateFile = path.join(environment.CODEX_TITLE_ANIMATION_STATE_DIR, "thread-a.json");
   t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
   writeFileSync(stateFile, JSON.stringify({
@@ -603,6 +577,7 @@ test("a stale state starts a replacement without signaling an unrelated PID", (t
     runId: "stale-run",
     threadId: "thread-a",
     scriptPath: "/tmp/codex-title-animation.mjs",
+    processTitle: "codex-title-animation:thread-a:stale-run",
     animationFile: "ping-pong.txt"
   }));
 
@@ -615,7 +590,7 @@ test("a stale state starts a replacement without signaling an unrelated PID", (t
 
 test("invalid animation input does not replace a running animation", (t) => {
   const environment = temporaryEnvironment();
-  const manager = fakeProcessManager();
+  const manager = fakeSessionManager();
   const dependencies = {
     ...manager.dependencies,
     resolveAnimation: (fileName) => {
@@ -633,62 +608,9 @@ test("invalid animation input does not replace a running animation", (t) => {
   assert.deepEqual(readAnimationState(environment, "thread-a"), stateBeforeFailure);
 });
 
-test("spawn failure removes only the failed thread provisional state", (t) => {
-  const environment = temporaryEnvironment();
-  const manager = fakeProcessManager();
-  t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
-  startAnimation("thread-b", environment, manager.dependencies);
-  const stateBeforeFailureB = readAnimationState(environment, "thread-b");
-  const failingDependencies = { ...manager.dependencies, spawn: () => { throw new Error("spawn failed"); } };
-
-  assert.throws(() => startAnimation("thread-a", environment, failingDependencies), /spawn failed/);
-  assert.equal(existsSync(path.join(environment.CODEX_TITLE_ANIMATION_STATE_DIR, "thread-a.json")), false);
-  assert.deepEqual(readAnimationState(environment, "thread-b"), stateBeforeFailureB);
-});
-
-test("a final state write failure terminates the spawned child and removes provisional state", (t) => {
-  const environment = temporaryEnvironment();
-  const manager = fakeProcessManager();
-  let writes = 0;
-  t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
-  const dependencies = {
-    ...manager.dependencies,
-    writeState: (threadId, state, targetEnvironment) => {
-      writes += 1;
-      if (writes === 2) throw new Error("state disk full");
-      mkdirSync(targetEnvironment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true });
-      writeFileSync(path.join(targetEnvironment.CODEX_TITLE_ANIMATION_STATE_DIR, `${encodeURIComponent(threadId)}.json`), JSON.stringify(state));
-    }
-  };
-
-  assert.throws(() => startAnimation("thread-a", environment, dependencies), /state disk full/);
-  assert.deepEqual(manager.killed, [{ pid: manager.spawned[0].child.pid, signal: "SIGTERM" }]);
-  assert.equal(existsSync(path.join(environment.CODEX_TITLE_ANIMATION_STATE_DIR, "thread-a.json")), false);
-});
-
-test("a final state write failure still removes state when the child already exited", (t) => {
-  const environment = temporaryEnvironment();
-  const manager = fakeProcessManager();
-  let writes = 0;
-  t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
-  const dependencies = {
-    ...manager.dependencies,
-    kill: () => { throw Object.assign(new Error("already gone"), { code: "ESRCH" }); },
-    writeState: (threadId, state, targetEnvironment) => {
-      writes += 1;
-      if (writes === 2) throw new Error("state disk full");
-      mkdirSync(targetEnvironment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true });
-      writeFileSync(path.join(targetEnvironment.CODEX_TITLE_ANIMATION_STATE_DIR, `${encodeURIComponent(threadId)}.json`), JSON.stringify(state));
-    }
-  };
-
-  assert.throws(() => startAnimation("thread-a", environment, dependencies), /state disk full/);
-  assert.equal(existsSync(path.join(environment.CODEX_TITLE_ANIMATION_STATE_DIR, "thread-a.json")), false);
-});
-
 test("a restart restores the previous state when signaling it fails", (t) => {
   const environment = temporaryEnvironment();
-  const manager = fakeProcessManager();
+  const manager = fakeSessionManager();
   t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
   const first = startAnimation("thread-a", environment, manager.dependencies, "first.txt");
   const previousState = readAnimationState(environment, "thread-a");
@@ -697,12 +619,11 @@ test("a restart restores the previous state when signaling it fails", (t) => {
   assert.throws(() => startAnimation("thread-a", environment, { ...manager.dependencies, kill: () => { throw signalError; } }, "second.txt"), /signal denied/);
   assert.deepEqual(readAnimationState(environment, "thread-a"), previousState);
   assert.equal(manager.running.has(first.pid), true);
-  assert.equal(manager.spawned.length, 1);
 });
 
 test("a restart continues when the previous process disappears before SIGTERM", (t) => {
   const environment = temporaryEnvironment();
-  const manager = fakeProcessManager();
+  const manager = fakeSessionManager();
   t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
   const first = startAnimation("thread-a", environment, manager.dependencies, "first.txt");
   const dependencies = {
@@ -725,27 +646,26 @@ test("start and stop report a corrupt state file without overwriting it", (t) =>
   t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
   writeFileSync(stateFile, "not-json\n");
 
-  assert.throws(() => startAnimation("thread-a", environment, fakeProcessManager().dependencies), /Could not read animation state/);
+  assert.throws(() => startAnimation("thread-a", environment, fakeSessionManager().dependencies), /Could not read animation state/);
   assert.throws(() => stopAnimation("thread-a", environment), /Could not read animation state/);
   assert.equal(readFileSync(stateFile, "utf8"), "not-json\n");
 });
 
 test("stop requests SIGTERM only for the tracked animation", (t) => {
   const environment = temporaryEnvironment();
+  const manager = fakeSessionManager();
   t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
-  const child = { pid: process.pid, unref() {} };
-  const dependencies = { spawn: () => child, processCommand: (state) => `${state.scriptPath} run thread-42 ${state.runId}` };
-  startAnimation("thread-42", environment, dependencies);
+  const started = startAnimation("thread-42", environment, manager.dependencies);
   let signal;
-  assert.deepEqual(stopAnimation("thread-42", environment, { ...dependencies, kill: (_pid, requestedSignal) => { signal = requestedSignal; } }), { stopped: true, pid: process.pid });
+  assert.deepEqual(stopAnimation("thread-42", environment, { ...manager.dependencies, kill: (_pid, requestedSignal) => { signal = requestedSignal; } }), { stopped: true, pid: started.pid });
   assert.equal(signal, "SIGTERM");
 });
 
 test("stop ignores a state file whose PID belongs to another process", (t) => {
   const environment = temporaryEnvironment();
+  const manager = fakeSessionManager();
   t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
-  const child = { pid: process.pid, unref() {} };
-  startAnimation("thread-42", environment, { spawn: () => child, processCommand: (state) => `${state.scriptPath} run thread-42 ${state.runId}` });
+  startAnimation("thread-42", environment, manager.dependencies);
   let killCalled = false;
   const result = stopAnimation("thread-42", environment, {
     processCommand: () => "/tmp/unrelated-process",
@@ -778,7 +698,7 @@ test("stop removes stale state without signaling a process", (t) => {
 
 test("stop treats ESRCH as an already-stopped animation and removes state", (t) => {
   const environment = temporaryEnvironment();
-  const manager = fakeProcessManager();
+  const manager = fakeSessionManager();
   t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
   const started = startAnimation("thread-a", environment, manager.dependencies);
 
@@ -794,7 +714,12 @@ test("main routes start, stop, and run arguments", async () => {
   const calls = [];
   const messages = [];
   const dependencies = {
-    startAnimation: (...argumentsValue) => { calls.push(["start", ...argumentsValue]); return { started: true, pid: 51 }; },
+    startAnimation: (...argumentsValue) => {
+      calls.push(["start", ...argumentsValue]);
+      const threadId = argumentsValue[0];
+      const animationFile = argumentsValue[3] || "ping-pong.txt";
+      return { started: true, pid: 51, runId: `run-${threadId}`, animationFile };
+    },
     stopAnimation: (...argumentsValue) => { calls.push(["stop", ...argumentsValue]); return { stopped: true, pid: 52 }; },
     runAnimation: async (...argumentsValue) => { calls.push(["run", ...argumentsValue]); },
     animationDependencies: { marker: true },
@@ -811,17 +736,21 @@ test("main routes start, stop, and run arguments", async () => {
 
   assert.deepEqual(calls, [
     ["start", "thread-a", environment, dependencies.animationDependencies, "spinner.txt"],
+    ["run", "thread-a", "run-thread-a", environment, dependencies.animationDependencies, "spinner.txt"],
     ["start", "thread-b", environment, dependencies.animationDependencies, undefined],
+    ["run", "thread-b", "run-thread-b", environment, dependencies.animationDependencies, "ping-pong.txt"],
     ["start", "thread-c", environment, dependencies.animationDependencies, "wizard.txt"],
+    ["run", "thread-c", "run-thread-c", environment, dependencies.animationDependencies, "wizard.txt"],
     ["start", "thread-d", environment, dependencies.animationDependencies, undefined],
+    ["run", "thread-d", "run-thread-d", environment, dependencies.animationDependencies, "ping-pong.txt"],
     ["stop", "thread-a", environment, dependencies.animationDependencies],
     ["run", "thread-a", "run-1", environment, dependencies.animationDependencies, "spinner.txt"]
   ]);
   assert.deepEqual(messages, [
-    "Animation started (PID 51).",
-    "Animation started (PID 51).",
-    "Animation started (PID 51).",
-    "Animation started (PID 51).",
+    "Animation session started (PID 51). Keep this terminal session running.",
+    "Animation session started (PID 51). Keep this terminal session running.",
+    "Animation session started (PID 51). Keep this terminal session running.",
+    "Animation session started (PID 51). Keep this terminal session running.",
     "Animation stop requested (PID 52)."
   ]);
 });

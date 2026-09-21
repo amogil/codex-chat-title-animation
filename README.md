@@ -16,9 +16,10 @@ Restart Codex or reload its skills after installation.
 
 ## Use
 
-Ask Codex in the target task to start the title animation. The skill starts a
-detached process and immediately returns; the animation continues until it is
-stopped or Codex exits.
+Ask Codex in the target task to start the title animation. The skill keeps the
+animation in a managed background terminal session. Codex returns control to
+the chat without waiting for that session to finish; the animation continues
+until it is stopped, the task is archived or deleted, or Codex exits.
 
 To run it directly from a Codex task environment:
 
@@ -29,8 +30,11 @@ zsh "$SKILL_PATH/scripts/codex-title-animation.sh" start "$CODEX_THREAD_ID" "Rev
 zsh "$SKILL_PATH/scripts/codex-title-animation.sh" stop "$CODEX_THREAD_ID"
 ```
 
-`start` prints the animation PID and replaces an existing animation for that
-task. Its optional second argument is a short model-generated description of
+`start` prints the animation PID and then intentionally keeps running in the
+terminal session. When Codex invokes it, that terminal session must be left
+running in the background rather than awaited to completion. A repeated start
+replaces the existing animation for that task. Its optional second argument is
+a short model-generated description of
 the current work. The description is accepted for forward compatibility but
 is not used yet. Codex always derives and supplies it from the current task
 without asking the user; it remains optional only for manual CLI calls. The
@@ -51,5 +55,6 @@ animations concurrently, while repeated starts in one task always replace that
 task's previous animation.
 
 The launcher uses Node bundled with Codex, so no system Node.js installation is
-required. This is an internal IPC integration and may need adjustment after a
-Codex update.
+required. The managed terminal session is part of the animation lifetime; do
+not close it unless the animation should stop. This is an internal IPC
+integration and may need adjustment after a Codex update.

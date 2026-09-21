@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { execFileSync, spawn } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -97,7 +97,7 @@ function isTrackedAnimation(state, dependencies = {}) {
   const processIsRunning = dependencies.isRunning || isRunning;
   if (!state || !processIsRunning(state.pid)) return false;
   const command = dependencies.processCommand ? dependencies.processCommand(state) : processCommand(state.pid);
-  return command.includes(state.scriptPath) && command.includes(" run ") && command.includes(state.runId);
+  return typeof state.processTitle === "string" && command.includes(state.processTitle);
 }
 
 function commandOutput(command, argumentsValue) {
@@ -259,47 +259,23 @@ export function startAnimation(threadId, environment = process.env, dependencies
   const selectedAnimation = (dependencies.resolveAnimation || resolveAnimation)(animationFile, dependencies.animationDirectory);
   const read = dependencies.readState || readState;
   const write = dependencies.writeState || writeState;
-  const remove = dependencies.removeState || removeState;
   const kill = dependencies.kill || process.kill;
   const previous = read(threadId, environment);
   const runId = randomUUID();
   const scriptPath = path.resolve(process.argv[1]);
-  write(threadId, { pid: null, runId, threadId, scriptPath, animationFile: selectedAnimation.fileName }, environment);
   const previousIsTracked = isTrackedAnimation(previous, dependencies);
-  const spawnProcess = dependencies.spawn || spawn;
-  let child;
-  let previousStopRequested = false;
-  try {
-    if (previousIsTracked) {
-      try {
-        kill(previous.pid, "SIGTERM");
-      } catch (error) {
-        if (error.code !== "ESRCH") throw error;
-      }
-      previousStopRequested = true;
+  if (previousIsTracked) {
+    try {
+      kill(previous.pid, "SIGTERM");
+    } catch (error) {
+      if (error.code !== "ESRCH") throw error;
     }
-    child = spawnProcess(process.execPath, [scriptPath, "run", threadId, selectedAnimation.fileName, runId], {
-      detached: true,
-      stdio: "ignore",
-      env: environment
-    });
-    child.unref();
-    write(threadId, { pid: child.pid, runId, threadId, scriptPath, animationFile: selectedAnimation.fileName }, environment);
-    return { started: true, pid: child.pid };
-  } catch (error) {
-    let cleanupError;
-    if (child?.pid) {
-      try {
-        kill(child.pid, "SIGTERM");
-      } catch (killError) {
-        if (killError.code !== "ESRCH") cleanupError = killError;
-      }
-    }
-    if (previousIsTracked && !previousStopRequested) write(threadId, previous, environment);
-    else remove(threadId, runId, environment);
-    if (cleanupError) throw new AggregateError([error, cleanupError], "Animation start failed and the spawned process could not be terminated.");
-    throw error;
   }
+  const pid = (dependencies.getPid || (() => process.pid))();
+  const processTitle = `codex-title-animation:${threadId}:${runId}`;
+  (dependencies.setProcessTitle || ((title) => { process.title = title; }))(processTitle, pid);
+  write(threadId, { pid, runId, threadId, scriptPath, processTitle, animationFile: selectedAnimation.fileName }, environment);
+  return { started: true, pid, runId, animationFile: selectedAnimation.fileName };
 }
 
 export function stopAnimation(threadId, environment = process.env, dependencies = {}) {
@@ -334,8 +310,10 @@ export async function main(argumentsValue = process.argv.slice(2), environment =
     const animationFile = optionalArguments.length === 1 && optionalArguments[0].endsWith(".txt")
       ? optionalArguments[0]
       : optionalArguments[1];
-    const result = start(threadId, environment, dependencies.animationDependencies || {}, animationFile);
-    log(`Animation started (PID ${result.pid}).`);
+    const animationDependencies = dependencies.animationDependencies || {};
+    const result = start(threadId, environment, animationDependencies, animationFile);
+    log(`Animation session started (PID ${result.pid}). Keep this terminal session running.`);
+    await run(threadId, result.runId, environment, animationDependencies, result.animationFile);
     return;
   }
   if (action === "stop") {
