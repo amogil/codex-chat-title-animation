@@ -22,5 +22,5 @@ while IFS= read -r candidate; do
   fi
 done < <(find /Applications -maxdepth 7 -type f -path '*/Contents/Resources/*/bin/node' 2>/dev/null)
 
-print -u2 'Codex bundled Node was not found. Open the macOS Codex desktop app and try again.'
+print -u2 'Codex bundled Node was not found. Open the Codex desktop app and try again.'
 exit 1

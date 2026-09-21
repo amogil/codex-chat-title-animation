@@ -1,0 +1,4 @@
+[|] tiny hamster 1
+[/] tiny hamster 1
+[-] tiny hamster 1
+[\] tiny hamster 1
