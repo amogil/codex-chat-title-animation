@@ -12,7 +12,7 @@ The script has two actions:
 
 ```zsh
 SKILL_PATH="${CODEX_HOME:-$HOME/.codex}/skills/codex-chat-title-animation"
-zsh "$SKILL_PATH/scripts/codex-title-animation.sh" start "$CODEX_THREAD_ID" "Running tests" "wizard.txt"
+zsh "$SKILL_PATH/scripts/codex-title-animation.sh" start "$CODEX_THREAD_ID" "Running tests" "wizard"
 zsh "$SKILL_PATH/scripts/codex-title-animation.sh" start "$CODEX_THREAD_ID" "Reviewing changes"
 zsh "$SKILL_PATH/scripts/codex-title-animation.sh" stop "$CODEX_THREAD_ID"
 ```
@@ -29,13 +29,15 @@ zsh "$SKILL_PATH/scripts/codex-title-animation.sh" stop "$CODEX_THREAD_ID"
   starts an animation, it must derive and pass this description from the
   current chat without asking the user. Prefer a concrete phrase of two to six
   words. The argument remains optional only for manual CLI compatibility. It
-  is reserved for future title composition and is not used by the current
-  implementation.
-- `animation-file` is an optional `.txt` filename from `animations/`. Each line
-  uses `FRAME DELAY_SECONDS`; the numeric delay must be from 1 to 60 seconds.
-  Without a filename, use the first file in alphabetical order. When the only
-  optional argument ends in `.txt`, the script treats it as `animation-file`
-  and leaves `current-work` empty.
+  replaces every `{work}` placeholder in an animation frame. When omitted,
+  the placeholder is removed.
+- `animation-name` is an optional name from `animations/`. Animation files have
+  no extension. Each line uses `FRAME DELAY_SECONDS`; the numeric delay must be
+  from 1 to 60 seconds. Without a name, use the first animation in alphabetical
+  order. Arguments are strictly positional: the second argument is always
+  `current-work`, and the third is always `animation-name`. For a manual start
+  without current work, pass an empty second argument. Frames may include
+  `{work}` one or more times.
 - `stop` returns immediately after terminating only the tracked animation
   session for that task. It is safe when no animation is running.
 
@@ -46,3 +48,7 @@ animation continues in that managed session. Do not poll or wait on it. To stop
 it, run the `stop` command above; the original terminal session should then
 finish. Do not use this skill for persistent production automation or to change
 a task title without the user's request.
+
+The worker silently retries temporary IPC failures after 1, 2, and 4 seconds.
+After the third failed retry it reports one final error and exits. Do not add an
+unbounded retry loop or print a message for every retry.

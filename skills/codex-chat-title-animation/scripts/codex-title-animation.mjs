@@ -11,40 +11,49 @@ import process from "node:process";
 const PIPE_ENVIRONMENT_VARIABLE = "CODEX_APP_TOOLS_PIPE_PATH";
 const DEFAULT_ANIMATION_DIRECTORY = fileURLToPath(new URL("../animations/", import.meta.url));
 
-export function listAnimationFiles(animationDirectory = DEFAULT_ANIMATION_DIRECTORY) {
-  let files;
+export function listAnimations(animationDirectory = DEFAULT_ANIMATION_DIRECTORY) {
+  let names;
   try {
-    files = readdirSync(animationDirectory, { withFileTypes: true })
-      .filter((entry) => entry.isFile() && entry.name.endsWith(".txt"))
+    names = readdirSync(animationDirectory, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && !entry.name.startsWith(".") && path.extname(entry.name) === "")
       .map((entry) => entry.name)
       .sort();
   } catch (error) {
     throw new Error(`Could not read animation directory: ${error.message}`);
   }
-  if (files.length === 0) throw new Error("No animation files were found.");
-  return files;
+  if (names.length === 0) throw new Error("No animations were found.");
+  return names;
 }
 
-export function resolveAnimation(animationFile, animationDirectory = DEFAULT_ANIMATION_DIRECTORY) {
-  const files = listAnimationFiles(animationDirectory);
-  const selectedFile = animationFile || files[0];
-  if (!files.includes(selectedFile)) throw new Error(`Animation file was not found: ${selectedFile}`);
-  const contents = readFileSync(path.join(animationDirectory, selectedFile), "utf8");
+export function resolveAnimation(animationName, animationDirectory = DEFAULT_ANIMATION_DIRECTORY) {
+  const names = listAnimations(animationDirectory);
+  const selectedName = animationName || names[0];
+  if (!names.includes(selectedName)) throw new Error(`Animation was not found: ${selectedName}`);
+  const contents = readFileSync(path.join(animationDirectory, selectedName), "utf8");
   const lines = contents.split(/\r?\n/);
   if (lines.at(-1) === "") lines.pop();
   if (lines.length === 0 || lines.every((line) => line.length === 0)) {
-    throw new Error(`Animation file has no frames: ${selectedFile}`);
+    throw new Error(`Animation has no frames: ${selectedName}`);
   }
   const steps = lines.map((line, index) => {
     const match = line.match(/^(.*\S)\s+([0-9]+(?:\.[0-9]+)?)\s*$/);
-    if (!match) throw new Error(`Invalid animation line ${index + 1} in ${selectedFile}: expected FRAME DELAY_SECONDS`);
+    if (!match) throw new Error(`Invalid animation line ${index + 1} in ${selectedName}: expected FRAME DELAY_SECONDS`);
     const delaySeconds = Number(match[2]);
     if (delaySeconds < 1 || delaySeconds > 60) {
-      throw new Error(`Invalid delay on line ${index + 1} in ${selectedFile}: expected a value from 1 to 60 seconds`);
+      throw new Error(`Invalid delay on line ${index + 1} in ${selectedName}: expected a value from 1 to 60 seconds`);
     }
     return { frame: match[1], delaySeconds };
   });
-  return { fileName: selectedFile, steps };
+  return { name: selectedName, steps };
+}
+
+export function isTransientIpcError(error) {
+  if (["ECONNREFUSED", "ECONNRESET", "ENOENT", "EPIPE", "ETIMEDOUT"].includes(error?.code)) return true;
+  return /Timed out waiting for Codex desktop IPC pipe|Codex desktop IPC pipe closed before sending a complete response|No active Codex desktop IPC pipe was found/.test(error?.message || "");
+}
+
+export function renderFrame(frame, currentWork = "") {
+  return frame.replaceAll("{work}", () => currentWork).replace(/[ \t]+$/, "");
 }
 
 function stateDirectory(environment = process.env) {
@@ -209,7 +218,7 @@ export async function readThread(pipePath, threadId) {
   }
 }
 
-export async function runAnimation(threadId, runId, environment = process.env, dependencies = {}, animationFile) {
+export async function runAnimation(threadId, runId, environment = process.env, dependencies = {}, animationName, currentWork = "") {
   let stopping = false;
   let cancelDelay;
   const stop = () => {
@@ -220,10 +229,12 @@ export async function runAnimation(threadId, runId, environment = process.env, d
   signalTarget.once("SIGTERM", stop);
   signalTarget.once("SIGINT", stop);
   try {
-    const pipePath = (dependencies.findPipePath || findPipePath)(environment);
+    const getPipePath = dependencies.findPipePath || findPipePath;
     const updateTitle = dependencies.setTitle || setTitle;
     const getThread = dependencies.readThread || readThread;
     const runIsCurrent = dependencies.isCurrentRun || isCurrentRun;
+    const transientError = dependencies.isTransientIpcError || isTransientIpcError;
+    const retryDelays = dependencies.retryDelays || [1000, 2000, 4000];
     const sleep = dependencies.sleep || ((milliseconds) => new Promise((resolve) => {
       const finish = () => {
         cancelDelay = undefined;
@@ -235,17 +246,28 @@ export async function runAnimation(threadId, runId, environment = process.env, d
         finish();
       };
     }));
-    const steps = dependencies.steps || (dependencies.resolveAnimation || resolveAnimation)(animationFile, dependencies.animationDirectory).steps;
+    const steps = dependencies.steps || (dependencies.resolveAnimation || resolveAnimation)(animationName, dependencies.animationDirectory).steps;
     let frameIndex = 0;
+    let retryIndex = 0;
     while (!stopping) {
       if (!runIsCurrent(threadId, runId, environment)) return;
-      const thread = await getThread(pipePath, threadId);
-      if (stopping || !runIsCurrent(threadId, runId, environment)) return;
-      if (thread?.status?.type !== "active") return;
-      const step = steps[frameIndex % steps.length];
-      await updateTitle(pipePath, threadId, step.frame);
-      frameIndex += 1;
-      if (!stopping) await sleep(step.delaySeconds * 1000);
+      try {
+        const pipePath = getPipePath(environment);
+        const thread = await getThread(pipePath, threadId);
+        if (stopping || !runIsCurrent(threadId, runId, environment)) return;
+        if (thread?.status?.type === "archived") return;
+        const step = steps[frameIndex % steps.length];
+        await updateTitle(pipePath, threadId, renderFrame(step.frame, currentWork));
+        frameIndex += 1;
+        retryIndex = 0;
+        if (!stopping) await sleep(step.delaySeconds * 1000);
+      } catch (error) {
+        if (stopping || !runIsCurrent(threadId, runId, environment)) return;
+        if (!transientError(error) || retryIndex >= retryDelays.length) throw error;
+        const retryDelay = retryDelays[retryIndex];
+        retryIndex += 1;
+        await sleep(retryDelay);
+      }
     }
   } finally {
     signalTarget.removeListener("SIGTERM", stop);
@@ -254,9 +276,9 @@ export async function runAnimation(threadId, runId, environment = process.env, d
   }
 }
 
-export function startAnimation(threadId, environment = process.env, dependencies = {}, animationFile) {
+export function startAnimation(threadId, environment = process.env, dependencies = {}, animationName, currentWork = "") {
   if (!threadId) throw new Error("Usage: codex-title-animation start THREAD_ID");
-  const selectedAnimation = (dependencies.resolveAnimation || resolveAnimation)(animationFile, dependencies.animationDirectory);
+  const selectedAnimation = (dependencies.resolveAnimation || resolveAnimation)(animationName, dependencies.animationDirectory);
   const read = dependencies.readState || readState;
   const write = dependencies.writeState || writeState;
   const kill = dependencies.kill || process.kill;
@@ -274,8 +296,8 @@ export function startAnimation(threadId, environment = process.env, dependencies
   const pid = (dependencies.getPid || (() => process.pid))();
   const processTitle = `codex-title-animation:${threadId}:${runId}`;
   (dependencies.setProcessTitle || ((title) => { process.title = title; }))(processTitle, pid);
-  write(threadId, { pid, runId, threadId, scriptPath, processTitle, animationFile: selectedAnimation.fileName }, environment);
-  return { started: true, pid, runId, animationFile: selectedAnimation.fileName };
+  write(threadId, { pid, runId, threadId, scriptPath, processTitle, animationName: selectedAnimation.name, currentWork }, environment);
+  return { started: true, pid, runId, animationName: selectedAnimation.name, currentWork };
 }
 
 export function stopAnimation(threadId, environment = process.env, dependencies = {}) {
@@ -304,16 +326,15 @@ export async function main(argumentsValue = process.argv.slice(2), environment =
   const log = dependencies.log || console.log;
   if (action === "start") {
     if (!threadId || argumentsValue.length < 2 || argumentsValue.length > 4) {
-      throw new Error("Usage: codex-title-animation start THREAD_ID [CURRENT_WORK] [ANIMATION_FILE]");
+      throw new Error("Usage: codex-title-animation start THREAD_ID [CURRENT_WORK] [ANIMATION_NAME]");
     }
     const optionalArguments = argumentsValue.slice(2);
-    const animationFile = optionalArguments.length === 1 && optionalArguments[0].endsWith(".txt")
-      ? optionalArguments[0]
-      : optionalArguments[1];
     const animationDependencies = dependencies.animationDependencies || {};
-    const result = start(threadId, environment, animationDependencies, animationFile);
+    const currentWork = optionalArguments[0] || "";
+    const animationName = optionalArguments[1];
+    const result = start(threadId, environment, animationDependencies, animationName, currentWork);
     log(`Animation session started (PID ${result.pid}). Keep this terminal session running.`);
-    await run(threadId, result.runId, environment, animationDependencies, result.animationFile);
+    await run(threadId, result.runId, environment, animationDependencies, result.animationName, result.currentWork);
     return;
   }
   if (action === "stop") {
@@ -323,14 +344,14 @@ export async function main(argumentsValue = process.argv.slice(2), environment =
     return;
   }
   if (action === "run") {
-    const [, , animationFile, runId] = argumentsValue;
-    if (!threadId || !animationFile || !runId || argumentsValue.length !== 4) {
-      throw new Error("Usage: codex-title-animation run THREAD_ID ANIMATION_FILE RUN_ID");
+    const [, , animationName, runId, currentWork = ""] = argumentsValue;
+    if (!threadId || !animationName || !runId || argumentsValue.length > 5) {
+      throw new Error("Usage: codex-title-animation run THREAD_ID ANIMATION_NAME RUN_ID [CURRENT_WORK]");
     }
-    await run(threadId, runId, environment, dependencies.animationDependencies || {}, animationFile);
+    await run(threadId, runId, environment, dependencies.animationDependencies || {}, animationName, currentWork);
     return;
   }
-  throw new Error("Usage: codex-title-animation start THREAD_ID [CURRENT_WORK] [ANIMATION_FILE] | stop THREAD_ID");
+  throw new Error("Usage: codex-title-animation start THREAD_ID [CURRENT_WORK] [ANIMATION_NAME] | stop THREAD_ID");
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

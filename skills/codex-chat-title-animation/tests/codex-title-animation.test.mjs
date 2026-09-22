@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { spawnSync } from "node:child_process";
-import { listAnimationFiles, findPipePath, main, readThread, request, resolveAnimation, runAnimation, setTitle, startAnimation, stopAnimation } from "../scripts/codex-title-animation.mjs";
+import { listAnimations, findPipePath, isTransientIpcError, main, readThread, renderFrame, request, resolveAnimation, runAnimation, setTitle, startAnimation, stopAnimation } from "../scripts/codex-title-animation.mjs";
 
 const scriptPath = new URL("../scripts/codex-title-animation.mjs", import.meta.url);
 
@@ -30,7 +30,7 @@ function fakeSessionManager() {
       setProcessTitle: (title, pid) => running.set(pid, title),
       isRunning: (pid) => running.has(pid),
       processCommand: (state) => running.get(state.pid) || "",
-      resolveAnimation: (fileName) => ({ fileName: fileName || "ping-pong.txt", steps: [{ frame: "frame", delaySeconds: 1 }] }),
+      resolveAnimation: (name) => ({ name: name || "ping-pong", steps: [{ frame: "frame", delaySeconds: 1 }] }),
       kill: (pid, signal) => {
         killed.push({ pid, signal });
         if (!running.delete(pid)) throw Object.assign(new Error("already gone"), { code: "ESRCH" });
@@ -70,17 +70,17 @@ async function temporarySocketServer(t, handler) {
 test("animation files are sorted and the first file is the default", (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "codex-title-animation-files-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
-  writeFileSync(path.join(directory, "z-last.txt"), "z1 1\nz2 2.5\n");
-  writeFileSync(path.join(directory, "a-first.txt"), "a1 1\na2 60\n");
+  writeFileSync(path.join(directory, "z-last"), "z1 1\nz2 2.5\n");
+  writeFileSync(path.join(directory, "a-first"), "a1 1\na2 60\n");
   writeFileSync(path.join(directory, "ignored.md"), "ignored\n");
 
-  assert.deepEqual(listAnimationFiles(directory), ["a-first.txt", "z-last.txt"]);
+  assert.deepEqual(listAnimations(directory), ["a-first", "z-last"]);
   assert.deepEqual(resolveAnimation(undefined, directory), {
-    fileName: "a-first.txt",
+    name: "a-first",
     steps: [{ frame: "a1", delaySeconds: 1 }, { frame: "a2", delaySeconds: 60 }]
   });
-  assert.deepEqual(resolveAnimation("z-last.txt", directory), {
-    fileName: "z-last.txt",
+  assert.deepEqual(resolveAnimation("z-last", directory), {
+    name: "z-last",
     steps: [{ frame: "z1", delaySeconds: 1 }, { frame: "z2", delaySeconds: 2.5 }]
   });
 });
@@ -88,28 +88,28 @@ test("animation files are sorted and the first file is the default", (t) => {
 test("animation files reject unknown paths and invalid lines", (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "codex-title-animation-files-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
-  writeFileSync(path.join(directory, "empty.txt"), "\n\n");
+  writeFileSync(path.join(directory, "empty"), "\n\n");
 
-  assert.throws(() => resolveAnimation("../outside.txt", directory), /not found/);
-  assert.throws(() => resolveAnimation("missing.txt", directory), /not found/);
-  assert.throws(() => resolveAnimation("empty.txt", directory), /no frames/);
-  writeFileSync(path.join(directory, "legacy.txt"), "frame-without-delay\n");
-  assert.throws(() => resolveAnimation("legacy.txt", directory), /expected FRAME DELAY_SECONDS/);
-  writeFileSync(path.join(directory, "blank.txt"), "frame 1\n\nframe 2\n");
-  assert.throws(() => resolveAnimation("blank.txt", directory), /line 2/);
-  writeFileSync(path.join(directory, "too-short.txt"), "frame 0.5\n");
-  assert.throws(() => resolveAnimation("too-short.txt", directory), /from 1 to 60/);
-  writeFileSync(path.join(directory, "too-long.txt"), "frame 61\n");
-  assert.throws(() => resolveAnimation("too-long.txt", directory), /from 1 to 60/);
+  assert.throws(() => resolveAnimation("../outside", directory), /not found/);
+  assert.throws(() => resolveAnimation("missing", directory), /not found/);
+  assert.throws(() => resolveAnimation("empty", directory), /no frames/);
+  writeFileSync(path.join(directory, "legacy"), "frame-without-delay\n");
+  assert.throws(() => resolveAnimation("legacy", directory), /expected FRAME DELAY_SECONDS/);
+  writeFileSync(path.join(directory, "blank"), "frame 1\n\nframe 2\n");
+  assert.throws(() => resolveAnimation("blank", directory), /line 2/);
+  writeFileSync(path.join(directory, "too-short"), "frame 0.5\n");
+  assert.throws(() => resolveAnimation("too-short", directory), /from 1 to 60/);
+  writeFileSync(path.join(directory, "too-long"), "frame 61\n");
+  assert.throws(() => resolveAnimation("too-long", directory), /from 1 to 60/);
 });
 
 test("animation parser supports CRLF, spaces inside frames, and padded separators", (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "codex-title-animation-files-"));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
-  writeFileSync(path.join(directory, "spaced.txt"), "hello world    1.25\r\nnext frame\t60\r\n");
+  writeFileSync(path.join(directory, "spaced"), "hello world    1.25\r\nnext frame\t60\r\n");
 
-  assert.deepEqual(resolveAnimation("spaced.txt", directory), {
-    fileName: "spaced.txt",
+  assert.deepEqual(resolveAnimation("spaced", directory), {
+    name: "spaced",
     steps: [
       { frame: "hello world", delaySeconds: 1.25 },
       { frame: "next frame", delaySeconds: 60 }
@@ -117,17 +117,33 @@ test("animation parser supports CRLF, spaces inside frames, and padded separator
   });
 });
 
-test("animation directory must exist and contain at least one top-level txt file", (t) => {
+test("renderFrame inserts current work and removes an unused trailing placeholder", () => {
+  assert.equal(renderFrame("<<< {work} >>> {work}", "Running $& tests"), "<<< Running $& tests >>> Running $& tests");
+  assert.equal(renderFrame("rocket launch {work}"), "rocket launch");
+  assert.equal(renderFrame("no placeholder", "ignored"), "no placeholder");
+});
+
+test("bundled animations are wide and include the current-work placeholder", () => {
+  for (const name of listAnimations()) {
+    const animation = resolveAnimation(name);
+    for (const step of animation.steps) {
+      assert.match(step.frame, /\{work\}/, `${name} must include {work} in every frame`);
+      assert.ok(step.frame.replace("{work}", "").trim().length >= 16, `${name} frames must be visually wide`);
+    }
+  }
+});
+
+test("animation directory must exist and contain at least one extensionless animation", (t) => {
   const directory = mkdtempSync(path.join(os.tmpdir(), "codex-title-animation-files-"));
   const missingDirectory = path.join(directory, "missing");
   const nestedDirectory = path.join(directory, "nested");
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   mkdirSync(nestedDirectory);
-  writeFileSync(path.join(nestedDirectory, "hidden.txt"), "hidden 1\n");
+  writeFileSync(path.join(nestedDirectory, "hidden"), "hidden 1\n");
   writeFileSync(path.join(directory, "ignored.md"), "ignored 1\n");
 
-  assert.throws(() => listAnimationFiles(missingDirectory), /Could not read animation directory/);
-  assert.throws(() => listAnimationFiles(directory), /No animation files/);
+  assert.throws(() => listAnimations(missingDirectory), /Could not read animation directory/);
+  assert.throws(() => listAnimations(directory), /No animations/);
 });
 
 test("animation parser rejects malformed numeric delays", (t) => {
@@ -135,9 +151,9 @@ test("animation parser rejects malformed numeric delays", (t) => {
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const invalidValues = ["zero", "-1", "NaN", "Infinity", "1.", ".5", "1e1"];
   for (const [index, value] of invalidValues.entries()) {
-    const fileName = `invalid-${index}.txt`;
-    writeFileSync(path.join(directory, fileName), `frame ${value}\n`);
-    assert.throws(() => resolveAnimation(fileName, directory), /expected FRAME DELAY_SECONDS/);
+    const name = `invalid-${index}`;
+    writeFileSync(path.join(directory, name), `frame ${value}\n`);
+    assert.throws(() => resolveAnimation(name, directory), /expected FRAME DELAY_SECONDS/);
   }
 });
 
@@ -178,6 +194,13 @@ test("findPipePath rejects zero or multiple discovered sockets", () => {
     commandOutput: (command, argumentsValue) => command === "pgrep" ? "1\n2\n" : `CODEX_APP_TOOLS_PIPE_PATH=/tmp/${argumentsValue.at(-1)}.sock`,
     statSync: (value) => ({ isSocket: () => value !== "/tmp/not-a-socket" })
   }), /More than one Codex desktop IPC pipe.*1\.sock.*2\.sock/);
+});
+
+test("transient IPC errors are classified without treating task errors as transient", () => {
+  assert.equal(isTransientIpcError(new Error("Timed out waiting for Codex desktop IPC pipe.")), true);
+  assert.equal(isTransientIpcError(new Error("Codex desktop IPC pipe closed before sending a complete response.")), true);
+  assert.equal(isTransientIpcError(Object.assign(new Error("connect failed"), { code: "ECONNRESET" })), true);
+  assert.equal(isTransientIpcError(new Error("thread not found")), false);
 });
 
 test("request uses little-endian length framing and parses a response", async (t) => {
@@ -320,11 +343,27 @@ test("runAnimation advances through frames", async () => {
         delays.push(milliseconds);
         if (delays.length === 3) throw new Error("stop test loop");
       }
-    }),
+    }, undefined, "Running tests"),
     /stop test loop/
   );
   assert.deepEqual(titles, ["first", "second", "third"]);
   assert.deepEqual(delays, [1000, 2500, 60000]);
+});
+
+test("runAnimation renders current work into every published frame", async () => {
+  const titles = [];
+  await runAnimation("thread-42", "run", {}, {
+    findPipePath: () => "unused",
+    isCurrentRun: () => true,
+    readThread: async () => ({ status: { type: titles.length === 2 ? "archived" : "active" } }),
+    setTitle: async (_pipe, _thread, title) => titles.push(title),
+    sleep: async () => {},
+    steps: [
+      { frame: "<<< {work}", delaySeconds: 1 },
+      { frame: "{work} >>>", delaySeconds: 1 }
+    ]
+  }, "ignored", "Reviewing changes");
+  assert.deepEqual(titles, ["<<< Reviewing changes", "Reviewing changes >>>"]);
 });
 
 test("runAnimation loops from the last step back to the first", async () => {
@@ -382,16 +421,63 @@ test("runAnimation stops before reading a thread when its run id is stale", asyn
   assert.equal(readCalled, false);
 });
 
-test("runAnimation stops before changing a non-active thread", async () => {
-  let titleCalled = false;
+test("runAnimation continues across inactive turns until the thread is archived", async () => {
+  const titles = [];
+  const statuses = ["completed", "idle", "archived"];
   await runAnimation("thread-42", "run", {}, {
     findPipePath: () => "unused",
     isCurrentRun: () => true,
-    readThread: async () => ({ status: { type: "completed" } }),
-    setTitle: async () => { titleCalled = true; },
-    steps: [{ frame: "a", delaySeconds: 1 }]
+    readThread: async () => ({ status: { type: statuses.shift() } }),
+    setTitle: async (_pipe, _thread, title) => { titles.push(title); },
+    sleep: async () => {},
+    steps: [
+      { frame: "a", delaySeconds: 1 },
+      { frame: "b", delaySeconds: 1 }
+    ]
   });
-  assert.equal(titleCalled, false);
+  assert.deepEqual(titles, ["a", "b"]);
+  assert.deepEqual(statuses, []);
+});
+
+test("runAnimation retries transient IPC failures and then resumes the same frame", async () => {
+  const titles = [];
+  const delays = [];
+  let reads = 0;
+  let pipeDiscoveries = 0;
+  await runAnimation("thread-42", "run", {}, {
+    findPipePath: () => `pipe-${++pipeDiscoveries}`,
+    isCurrentRun: () => true,
+    readThread: async () => {
+      reads += 1;
+      if (reads <= 3) throw new Error("Timed out waiting for Codex desktop IPC pipe.");
+      return { status: { type: reads === 4 ? "active" : "archived" } };
+    },
+    setTitle: async (_pipe, _thread, title) => { titles.push(title); },
+    retryDelays: [10, 20, 30],
+    sleep: async (milliseconds) => { delays.push(milliseconds); },
+    steps: [{ frame: "same-frame", delaySeconds: 1 }]
+  });
+  assert.deepEqual(titles, ["same-frame"]);
+  assert.deepEqual(delays, [10, 20, 30, 1000]);
+  assert.equal(pipeDiscoveries, 5);
+});
+
+test("runAnimation stops retrying after the bounded transient IPC budget", async () => {
+  const delays = [];
+  let reads = 0;
+  await assert.rejects(runAnimation("thread-42", "run", {}, {
+    findPipePath: () => "unused",
+    isCurrentRun: () => true,
+    readThread: async () => {
+      reads += 1;
+      throw new Error("Timed out waiting for Codex desktop IPC pipe.");
+    },
+    retryDelays: [10, 20, 30],
+    sleep: async (milliseconds) => { delays.push(milliseconds); },
+    steps: [{ frame: "never-published", delaySeconds: 1 }]
+  }), /Timed out waiting/);
+  assert.equal(reads, 4);
+  assert.deepEqual(delays, [10, 20, 30]);
 });
 
 test("runAnimation cleans state when IPC discovery fails", async (t) => {
@@ -476,7 +562,7 @@ test("a run superseded while reading the thread does not publish another frame",
   assert.equal(readAnimationState(environment, "thread-42").runId, "new-run");
 });
 
-test("runAnimation removes state when its animation file cannot be loaded", async (t) => {
+test("runAnimation removes state when its animation cannot be loaded", async (t) => {
   const environment = temporaryEnvironment();
   const runId = "missing-animation-run";
   const stateFile = path.join(environment.CODEX_TITLE_ANIMATION_STATE_DIR, "thread-42.json");
@@ -486,7 +572,7 @@ test("runAnimation removes state when its animation file cannot be loaded", asyn
   await assert.rejects(runAnimation("thread-42", runId, environment, {
     findPipePath: () => "unused",
     resolveAnimation: () => { throw new Error("animation disappeared"); }
-  }, "missing.txt"), /animation disappeared/);
+  }, "missing"), /animation disappeared/);
   assert.equal(existsSync(stateFile), false);
 });
 
@@ -498,15 +584,17 @@ test("start prepares the current process as a foreground animation session", (t)
   delete dependencies.resolveAnimation;
   t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
   t.after(() => rmSync(animationDirectory, { recursive: true, force: true }));
-  writeFileSync(path.join(animationDirectory, "b.txt"), "b 1\n");
-  writeFileSync(path.join(animationDirectory, "a.txt"), "a 1\n");
+  writeFileSync(path.join(animationDirectory, "b"), "b 1\n");
+  writeFileSync(path.join(animationDirectory, "a"), "a 1\n");
 
-  const result = startAnimation("thread-a", environment, dependencies);
+  const result = startAnimation("thread-a", environment, dependencies, undefined, "Running tests");
   const state = readAnimationState(environment, "thread-a");
   assert.equal(result.pid, state.pid);
   assert.equal(result.runId, state.runId);
-  assert.equal(result.animationFile, "a.txt");
-  assert.equal(state.animationFile, "a.txt");
+  assert.equal(result.animationName, "a");
+  assert.equal(state.animationName, "a");
+  assert.equal(result.currentWork, "Running tests");
+  assert.equal(state.currentWork, "Running tests");
   assert.equal(state.processTitle, `codex-title-animation:thread-a:${state.runId}`);
   assert.equal(manager.running.get(state.pid), state.processTitle);
 });
@@ -521,15 +609,15 @@ test("different threads run independently at the same time", (t) => {
   const manager = fakeSessionManager();
   t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
 
-  const first = startAnimation("thread-a", environment, manager.dependencies, "ping-pong.txt");
-  const second = startAnimation("thread-b", environment, manager.dependencies, "spinner.txt");
+  const first = startAnimation("thread-a", environment, manager.dependencies, "ping-pong");
+  const second = startAnimation("thread-b", environment, manager.dependencies, "spinner");
 
   assert.notEqual(first.pid, second.pid);
   assert.equal(manager.killed.length, 0);
   assert.equal(readAnimationState(environment, "thread-a").pid, first.pid);
-  assert.equal(readAnimationState(environment, "thread-a").animationFile, "ping-pong.txt");
+  assert.equal(readAnimationState(environment, "thread-a").animationName, "ping-pong");
   assert.equal(readAnimationState(environment, "thread-b").pid, second.pid);
-  assert.equal(readAnimationState(environment, "thread-b").animationFile, "spinner.txt");
+  assert.equal(readAnimationState(environment, "thread-b").animationName, "spinner");
   assert.equal(manager.running.size, 2);
 });
 
@@ -538,15 +626,15 @@ test("restarting one thread replaces only that thread animation", (t) => {
   const manager = fakeSessionManager();
   t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
 
-  const firstA = startAnimation("thread-a", environment, manager.dependencies, "ping-pong.txt");
-  const firstB = startAnimation("thread-b", environment, manager.dependencies, "spinner.txt");
+  const firstA = startAnimation("thread-a", environment, manager.dependencies, "ping-pong");
+  const firstB = startAnimation("thread-b", environment, manager.dependencies, "spinner");
   const stateBeforeRestartB = readAnimationState(environment, "thread-b");
-  const secondA = startAnimation("thread-a", environment, manager.dependencies, "next-animation.txt");
+  const secondA = startAnimation("thread-a", environment, manager.dependencies, "next-animation");
 
   assert.deepEqual(manager.killed, [{ pid: firstA.pid, signal: "SIGTERM" }]);
   assert.notEqual(secondA.pid, firstA.pid);
   assert.equal(readAnimationState(environment, "thread-a").pid, secondA.pid);
-  assert.equal(readAnimationState(environment, "thread-a").animationFile, "next-animation.txt");
+  assert.equal(readAnimationState(environment, "thread-a").animationName, "next-animation");
   assert.deepEqual(readAnimationState(environment, "thread-b"), stateBeforeRestartB);
   assert.equal(manager.running.has(firstB.pid), true);
 });
@@ -578,14 +666,14 @@ test("a stale state starts a replacement without signaling an unrelated PID", (t
     threadId: "thread-a",
     scriptPath: "/tmp/codex-title-animation.mjs",
     processTitle: "codex-title-animation:thread-a:stale-run",
-    animationFile: "ping-pong.txt"
+    animationName: "ping-pong"
   }));
 
-  const replacement = startAnimation("thread-a", environment, manager.dependencies, "spinner.txt");
+  const replacement = startAnimation("thread-a", environment, manager.dependencies, "spinner");
 
   assert.equal(manager.killed.length, 0);
   assert.equal(readAnimationState(environment, "thread-a").pid, replacement.pid);
-  assert.equal(readAnimationState(environment, "thread-a").animationFile, "spinner.txt");
+  assert.equal(readAnimationState(environment, "thread-a").animationName, "spinner");
 });
 
 test("invalid animation input does not replace a running animation", (t) => {
@@ -593,16 +681,16 @@ test("invalid animation input does not replace a running animation", (t) => {
   const manager = fakeSessionManager();
   const dependencies = {
     ...manager.dependencies,
-    resolveAnimation: (fileName) => {
-      if (fileName === "missing.txt") throw new Error("Animation file was not found: missing.txt");
-      return { fileName: fileName || "ping-pong.txt", steps: [{ frame: "frame", delaySeconds: 1 }] };
+    resolveAnimation: (name) => {
+      if (name === "missing") throw new Error("Animation was not found: missing");
+      return { name: name || "ping-pong", steps: [{ frame: "frame", delaySeconds: 1 }] };
     }
   };
   t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
-  const active = startAnimation("thread-a", environment, dependencies, "ping-pong.txt");
+  const active = startAnimation("thread-a", environment, dependencies, "ping-pong");
   const stateBeforeFailure = readAnimationState(environment, "thread-a");
 
-  assert.throws(() => startAnimation("thread-a", environment, dependencies, "missing.txt"), /not found/);
+  assert.throws(() => startAnimation("thread-a", environment, dependencies, "missing"), /not found/);
   assert.equal(manager.killed.length, 0);
   assert.equal(manager.running.has(active.pid), true);
   assert.deepEqual(readAnimationState(environment, "thread-a"), stateBeforeFailure);
@@ -612,11 +700,11 @@ test("a restart restores the previous state when signaling it fails", (t) => {
   const environment = temporaryEnvironment();
   const manager = fakeSessionManager();
   t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
-  const first = startAnimation("thread-a", environment, manager.dependencies, "first.txt");
+  const first = startAnimation("thread-a", environment, manager.dependencies, "first");
   const previousState = readAnimationState(environment, "thread-a");
   const signalError = Object.assign(new Error("signal denied"), { code: "EPERM" });
 
-  assert.throws(() => startAnimation("thread-a", environment, { ...manager.dependencies, kill: () => { throw signalError; } }, "second.txt"), /signal denied/);
+  assert.throws(() => startAnimation("thread-a", environment, { ...manager.dependencies, kill: () => { throw signalError; } }, "second"), /signal denied/);
   assert.deepEqual(readAnimationState(environment, "thread-a"), previousState);
   assert.equal(manager.running.has(first.pid), true);
 });
@@ -625,7 +713,7 @@ test("a restart continues when the previous process disappears before SIGTERM", 
   const environment = temporaryEnvironment();
   const manager = fakeSessionManager();
   t.after(() => rmSync(environment.CODEX_TITLE_ANIMATION_STATE_DIR, { recursive: true, force: true }));
-  const first = startAnimation("thread-a", environment, manager.dependencies, "first.txt");
+  const first = startAnimation("thread-a", environment, manager.dependencies, "first");
   const dependencies = {
     ...manager.dependencies,
     kill: (pid) => {
@@ -634,10 +722,10 @@ test("a restart continues when the previous process disappears before SIGTERM", 
     }
   };
 
-  const replacement = startAnimation("thread-a", environment, dependencies, "second.txt");
+  const replacement = startAnimation("thread-a", environment, dependencies, "second");
   assert.notEqual(replacement.pid, first.pid);
   assert.equal(readAnimationState(environment, "thread-a").pid, replacement.pid);
-  assert.equal(readAnimationState(environment, "thread-a").animationFile, "second.txt");
+  assert.equal(readAnimationState(environment, "thread-a").animationName, "second");
 });
 
 test("start and stop report a corrupt state file without overwriting it", (t) => {
@@ -717,8 +805,9 @@ test("main routes start, stop, and run arguments", async () => {
     startAnimation: (...argumentsValue) => {
       calls.push(["start", ...argumentsValue]);
       const threadId = argumentsValue[0];
-      const animationFile = argumentsValue[3] || "ping-pong.txt";
-      return { started: true, pid: 51, runId: `run-${threadId}`, animationFile };
+      const animationName = argumentsValue[3] || "ping-pong";
+      const currentWork = argumentsValue[4] || "";
+      return { started: true, pid: 51, runId: `run-${threadId}`, animationName, currentWork };
     },
     stopAnimation: (...argumentsValue) => { calls.push(["stop", ...argumentsValue]); return { stopped: true, pid: 52 }; },
     runAnimation: async (...argumentsValue) => { calls.push(["run", ...argumentsValue]); },
@@ -727,26 +816,30 @@ test("main routes start, stop, and run arguments", async () => {
   };
   const environment = { TEST: "yes" };
 
-  await main(["start", "thread-a", "Running tests", "spinner.txt"], environment, dependencies);
+  await main(["start", "thread-a", "Running tests", "spinner"], environment, dependencies);
   await main(["start", "thread-b", "Reviewing changes"], environment, dependencies);
-  await main(["start", "thread-c", "wizard.txt"], environment, dependencies);
+  await main(["start", "thread-c", "", "wizard"], environment, dependencies);
   await main(["start", "thread-d"], environment, dependencies);
+  await main(["start", "thread-e", "wizard"], environment, dependencies);
   await main(["stop", "thread-a"], environment, dependencies);
-  await main(["run", "thread-a", "spinner.txt", "run-1"], environment, dependencies);
+  await main(["run", "thread-a", "spinner", "run-1", "Checking output"], environment, dependencies);
 
   assert.deepEqual(calls, [
-    ["start", "thread-a", environment, dependencies.animationDependencies, "spinner.txt"],
-    ["run", "thread-a", "run-thread-a", environment, dependencies.animationDependencies, "spinner.txt"],
-    ["start", "thread-b", environment, dependencies.animationDependencies, undefined],
-    ["run", "thread-b", "run-thread-b", environment, dependencies.animationDependencies, "ping-pong.txt"],
-    ["start", "thread-c", environment, dependencies.animationDependencies, "wizard.txt"],
-    ["run", "thread-c", "run-thread-c", environment, dependencies.animationDependencies, "wizard.txt"],
-    ["start", "thread-d", environment, dependencies.animationDependencies, undefined],
-    ["run", "thread-d", "run-thread-d", environment, dependencies.animationDependencies, "ping-pong.txt"],
+    ["start", "thread-a", environment, dependencies.animationDependencies, "spinner", "Running tests"],
+    ["run", "thread-a", "run-thread-a", environment, dependencies.animationDependencies, "spinner", "Running tests"],
+    ["start", "thread-b", environment, dependencies.animationDependencies, undefined, "Reviewing changes"],
+    ["run", "thread-b", "run-thread-b", environment, dependencies.animationDependencies, "ping-pong", "Reviewing changes"],
+    ["start", "thread-c", environment, dependencies.animationDependencies, "wizard", ""],
+    ["run", "thread-c", "run-thread-c", environment, dependencies.animationDependencies, "wizard", ""],
+    ["start", "thread-d", environment, dependencies.animationDependencies, undefined, ""],
+    ["run", "thread-d", "run-thread-d", environment, dependencies.animationDependencies, "ping-pong", ""],
+    ["start", "thread-e", environment, dependencies.animationDependencies, undefined, "wizard"],
+    ["run", "thread-e", "run-thread-e", environment, dependencies.animationDependencies, "ping-pong", "wizard"],
     ["stop", "thread-a", environment, dependencies.animationDependencies],
-    ["run", "thread-a", "run-1", environment, dependencies.animationDependencies, "spinner.txt"]
+    ["run", "thread-a", "run-1", environment, dependencies.animationDependencies, "spinner", "Checking output"]
   ]);
   assert.deepEqual(messages, [
+    "Animation session started (PID 51). Keep this terminal session running.",
     "Animation session started (PID 51). Keep this terminal session running.",
     "Animation session started (PID 51). Keep this terminal session running.",
     "Animation session started (PID 51). Keep this terminal session running.",
@@ -766,10 +859,10 @@ test("main reports when stop finds no tracked animation", async () => {
 
 test("main rejects unsupported and incomplete actions", async () => {
   await assert.rejects(main(["unknown", "thread-42"], {}), /Usage:/);
-  await assert.rejects(main(["start", "thread-42", "Testing", "spinner.txt", "extra"], {}), /CURRENT_WORK/);
+  await assert.rejects(main(["start", "thread-42", "Testing", "spinner", "extra"], {}), /CURRENT_WORK/);
   await assert.rejects(main(["stop", "thread-42", "extra"], {}), /stop THREAD_ID/);
   await assert.rejects(main(["run", "thread-42"], {}), /Usage:/);
-  await assert.rejects(main(["run", "thread-42", "spinner.txt", "run-1", "extra"], {}), /run THREAD_ID/);
+  await assert.rejects(main(["run", "thread-42", "spinner", "run-1", "work", "extra"], {}), /run THREAD_ID/);
 });
 
 test("the executable entrypoint prints usage errors and exits non-zero", () => {
